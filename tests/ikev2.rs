@@ -93,4 +93,221 @@ static IKEV2_MSG: &[u8] = &[
             assert_eq!(a.hdr.next_payload_type, IkePayloadType(*b));
         }
     }
+
+    // A well-formed single SA payload (proposal + 3 transforms), 40 bytes.
+    #[rustfmt::skip]
+    static STRICT_SA_PAYLOAD: &[u8] = &[
+        // next=NoNextPayload(0), flags, payload_length = 40
+        0x00, 0x00, 0x00, 0x28,
+        // proposal: last=0, reserved, proposal_length=36, num=1, proto=IKE, spi=0, ntrans=3
+        0x00, 0x00, 0x00, 0x24, 0x01, 0x01, 0x00, 0x03,
+        // transform 1: type=ENCR(1), id=12(AES_CBC), length=12, 4 attr bytes
+        0x03, 0x00, 0x00, 0x0c, 0x01, 0x00, 0x00, 0x0c, 0x80, 0x0e, 0x00, 0x80,
+        // transform 2: type=PRF(2), id=5, length=8
+        0x03, 0x00, 0x00, 0x08, 0x02, 0x00, 0x00, 0x05,
+        // transform 3: last=0, type=DH(4), id=30, length=8
+        0x00, 0x00, 0x00, 0x08, 0x04, 0x00, 0x00, 0x1e,
+    ];
+
+    fn strict_message(next: u8, payload: &[u8]) -> Vec<u8> {
+        let length = (28 + payload.len()) as u32;
+        let mut msg = Vec::new();
+        msg.extend_from_slice(&[0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88]); // init SPI
+        msg.extend_from_slice(&[0u8; 8]); // resp SPI
+        msg.push(next); // next payload
+        msg.push(0x20); // version 2.0
+        msg.push(34); // IKE_SA_INIT
+        msg.push(0x08); // flags
+        msg.extend_from_slice(&0u32.to_be_bytes()); // msg id
+        msg.extend_from_slice(&length.to_be_bytes()); // header length
+        msg.extend_from_slice(payload);
+        msg
+    }
+
+    #[test]
+    fn test_strict_valid_message() {
+        let bytes = strict_message(33, STRICT_SA_PAYLOAD);
+        let (hdr, payloads) =
+            parse_ikev2_message_strict(&bytes).expect("strict parser must accept valid message");
+        assert_eq!(hdr.length as usize, bytes.len());
+        assert_eq!(payloads.len(), 1);
+        assert_eq!(payloads[0].hdr.payload_length, 40);
+        assert_eq!(
+            payloads[0].hdr.next_payload_type,
+            IkePayloadType::NoNextPayload
+        );
+        match payloads[0].content {
+            IkeV2PayloadContent::SA(ref proposals) => {
+                assert_eq!(proposals.len(), 1);
+                assert_eq!(proposals[0].transforms.len(), 3);
+            }
+            _ => panic!("expected SA payload"),
+        }
+
+        // The strict result must match the lenient parser on valid input
+        // (the lenient list carries an extra dummy entry at index 0).
+        let (rem, (lenient_hdr, lenient_list)) =
+            parse_ikev2_message(&bytes).expect("lenient parser must accept valid message");
+        let lenient_list = lenient_list.expect("lenient payload list must be Ok");
+        assert!(rem.is_empty());
+        assert_eq!(lenient_hdr, hdr);
+        assert_eq!(lenient_list.len(), payloads.len() + 1);
+        assert_eq!(lenient_list[0].content, IkeV2PayloadContent::Dummy);
+        assert_eq!(lenient_list[1].hdr, payloads[0].hdr);
+        assert_eq!(lenient_list[1].content, payloads[0].content);
+    }
+
+    #[test]
+    fn test_strict_accepts_assets() {
+        for bytes in &[
+            include_bytes!("../assets/ike-sa-init-req.bin").to_vec(),
+            include_bytes!("../assets/ike-sa-init-resp.bin").to_vec(),
+        ] {
+            let (hdr, payloads) = parse_ikev2_message_strict(bytes)
+                .unwrap_or_else(|e| panic!("strict parser rejected valid asset: {:?}", e));
+            assert_eq!(hdr.length as usize, bytes.len());
+            assert!(!payloads.is_empty());
+            // chain must end with NoNextPayload and be fully sealed
+            assert_eq!(
+                payloads.last().unwrap().hdr.next_payload_type,
+                IkePayloadType::NoNextPayload
+            );
+        }
+    }
+
+    #[test]
+    fn test_strict_header_truncated() {
+        let bytes = strict_message(33, STRICT_SA_PAYLOAD);
+        // datagram shorter than the 28-byte IKEv2 header
+        assert_eq!(
+            parse_ikev2_message_strict(&bytes[..20]),
+            Err(IkeV2StrictError::Truncated)
+        );
+        // header announces more bytes than the datagram provides
+        let mut cut = bytes.clone();
+        cut.truncate(bytes.len() - 8);
+        assert_eq!(
+            parse_ikev2_message_strict(&cut),
+            Err(IkeV2StrictError::Truncated)
+        );
+    }
+
+    #[test]
+    fn test_strict_header_length_inconsistent() {
+        let bytes = strict_message(33, STRICT_SA_PAYLOAD);
+        // header length smaller than the actual datagram: extra trailing bytes
+        let mut extended = bytes.clone();
+        extended.extend_from_slice(&[0u8; 4]);
+        assert_eq!(
+            parse_ikev2_message_strict(&extended),
+            Err(IkeV2StrictError::LengthInconsistent)
+        );
+        // header length below the minimum header size
+        let mut bad = bytes.clone();
+        bad[24..28].copy_from_slice(&16u32.to_be_bytes());
+        assert_eq!(
+            parse_ikev2_message_strict(&bad),
+            Err(IkeV2StrictError::LengthInconsistent)
+        );
+    }
+
+    #[test]
+    fn test_strict_payload_length_out_of_bounds() {
+        let mut bytes = strict_message(33, STRICT_SA_PAYLOAD);
+        // announce a payload longer than the datagram area
+        let pl_off = 28 + 2;
+        let declared = (STRICT_SA_PAYLOAD.len() as u16) + 16;
+        bytes[pl_off..pl_off + 2].copy_from_slice(&declared.to_be_bytes());
+        assert_eq!(
+            parse_ikev2_message_strict(&bytes),
+            Err(IkeV2StrictError::Truncated)
+        );
+
+        // generic payload length smaller than its 4-byte header
+        let mut bytes = strict_message(33, STRICT_SA_PAYLOAD);
+        bytes[pl_off..pl_off + 2].copy_from_slice(&2u16.to_be_bytes());
+        assert_eq!(
+            parse_ikev2_message_strict(&bytes),
+            Err(IkeV2StrictError::LengthInconsistent)
+        );
+
+        // truncated mid-payload: header length matches but the payload area is
+        // cut short while its announced payload_length stays the same
+        let mut bytes = strict_message(33, STRICT_SA_PAYLOAD);
+        let total = bytes.len();
+        bytes[24..28].copy_from_slice(&((total - 8) as u32).to_be_bytes());
+        bytes.truncate(total - 8);
+        assert_eq!(
+            parse_ikev2_message_strict(&bytes),
+            Err(IkeV2StrictError::Truncated)
+        );
+    }
+
+    #[test]
+    fn test_strict_chain_inconsistent() {
+        // header announces SA(33) but the chain stops immediately
+        let bytes = strict_message(33, &[]);
+        assert_eq!(
+            parse_ikev2_message_strict(&bytes),
+            Err(IkeV2StrictError::Truncated)
+        );
+
+        // last payload claims another payload follows but none is present
+        let mut chained = STRICT_SA_PAYLOAD.to_vec();
+        chained[0] = 40; // claims another payload follows
+        let bytes = strict_message(33, &chained);
+        assert_eq!(
+            parse_ikev2_message_strict(&bytes),
+            Err(IkeV2StrictError::Truncated)
+        );
+
+        // header says NoNextPayload but a payload is present
+        let bytes = strict_message(0, STRICT_SA_PAYLOAD);
+        assert_eq!(
+            parse_ikev2_message_strict(&bytes),
+            Err(IkeV2StrictError::ChainInconsistent)
+        );
+    }
+
+    #[test]
+    fn test_strict_nested_length_sealed() {
+        let mut bytes = strict_message(33, STRICT_SA_PAYLOAD);
+        // proposal_length larger than the enclosing generic payload
+        let prop_len_off = 28 + 4 + 2; // generic header(4) + last,reserved(2)
+        bytes[prop_len_off..prop_len_off + 2].copy_from_slice(&200u16.to_be_bytes());
+        assert_eq!(
+            parse_ikev2_message_strict(&bytes),
+            Err(IkeV2StrictError::LengthInconsistent)
+        );
+
+        let mut bytes = strict_message(33, STRICT_SA_PAYLOAD);
+        // transform_length larger than the remaining proposal area
+        let tr_len_off = 28 + 4 + 8 + 2; // generic(4) + proposal fixed(8) + last,reserved(2)
+        bytes[tr_len_off..tr_len_off + 2].copy_from_slice(&100u16.to_be_bytes());
+        assert_eq!(
+            parse_ikev2_message_strict(&bytes),
+            Err(IkeV2StrictError::Truncated)
+        );
+
+        // transform_length smaller than its fixed 8-byte header
+        let mut bytes = strict_message(33, STRICT_SA_PAYLOAD);
+        bytes[tr_len_off..tr_len_off + 2].copy_from_slice(&4u16.to_be_bytes());
+        assert_eq!(
+            parse_ikev2_message_strict(&bytes),
+            Err(IkeV2StrictError::LengthInconsistent)
+        );
+
+        // a payload announces NoNextPayload while another payload still
+        // follows: the chain terminator appears in the middle of the message
+        let first = |next: u8, len: u16, body: u8| -> Vec<u8> {
+            vec![next, 0x00, (len >> 8) as u8, (len & 0xff) as u8, body]
+        };
+        let mut two_payloads = first(0, 5, 0xAA); // terminates the chain early
+        two_payloads.extend_from_slice(&first(0, 5, 0xBB));
+        let bytes = strict_message(43, &two_payloads); // header: VendorID
+        assert_eq!(
+            parse_ikev2_message_strict(&bytes),
+            Err(IkeV2StrictError::ChainInconsistent)
+        );
+    }
 } // mod ikev2

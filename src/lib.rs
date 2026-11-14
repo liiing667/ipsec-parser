@@ -67,12 +67,14 @@ mod ikev2;
 mod ikev2_debug;
 mod ikev2_notify;
 mod ikev2_parser;
+mod ikev2_strict;
 mod ikev2_transforms;
 pub use error::*;
 pub use esp::*;
 pub use ikev2::*;
 pub use ikev2_notify::*;
 pub use ikev2_parser::*;
+pub use ikev2_strict::*;
 pub use ikev2_transforms::*;
 
 // re-export modules
